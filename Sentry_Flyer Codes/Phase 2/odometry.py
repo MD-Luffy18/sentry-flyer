@@ -1,167 +1,182 @@
 """
 Sentry Flyer — Visual Odometry GPS-Denied Fallback Engine
 Location: Phase 2/odometry.py
-Purpose: Tracks high-contrast ground features across video frames using Lucas-Kanade 
-         optical flow, estimating physical displacement when GPS signals fail.
+Purpose: Tracks high-contrast ground features across video frames using
+         Lucas-Kanade optical flow and converts the observed pixel motion
+         into a body-frame displacement estimate when GPS is unavailable.
+
+Conventions
+-----------
+* Camera is nadir (pointing straight down) with image "up" aligned to the
+  aircraft's forward axis.
+* update_odometry() returns (right_m, forward_m): metres the *aircraft*
+  moved, which is the negative of the direction the ground appears to move.
+* Scale is derived from altitude and horizontal field of view:
+  metres_per_pixel = 2 * alt * tan(h_fov / 2) / frame_width.
+  Pass `meters_per_pixel_at_1m` to override with a calibrated value.
 """
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from typing import Optional
 
 import cv2
 import numpy as np
-import time
+
+log = logging.getLogger("sentry.odometry")
 
 
 class VisualOdometry:
-    def __init__(self, max_features=100, scaling_factor=0.05):
-        """
-        Initializes the visual tracker with feature limits and calibration scales.
-        """
+    MIN_TRACKED_POINTS = 10  # below this we re-seed the feature grid
+
+    def __init__(
+        self,
+        max_features: int = 100,
+        h_fov_deg: float = 100.0,
+        meters_per_pixel_at_1m: Optional[float] = None,
+        replenish_ratio: float = 0.6,
+    ):
         self.max_features = max_features
-        self.scaling_factor = scaling_factor  # Translates pixel movements to estimated physical meters
-        
-        # Parameters for Shi-Tomasi corner detection (finding reliable tracking points)
-        self.feature_params = dict(
-            maxCorners=self.max_features,
-            qualityLevel=0.3,
-            minDistance=7,
-            blockSize=7
-        )
-        
-        # Parameters for Lucas-Kanade optical flow tracking
+        self.h_fov_rad = math.radians(h_fov_deg)
+        self._mpp_override = meters_per_pixel_at_1m
+        self.replenish_ratio = replenish_ratio
+
+        # Shi-Tomasi corner detection: reliable, repeatable tracking points.
+        self.feature_params = dict(maxCorners=max_features, qualityLevel=0.3, minDistance=7, blockSize=7)
+        # Lucas-Kanade pyramidal optical flow.
         self.lk_params = dict(
             winSize=(15, 15),
             maxLevel=2,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
         )
-        
-        # State tracking variables
+
+        self.prev_gray: Optional[np.ndarray] = None
+        self.prev_points: Optional[np.ndarray] = None
+        self.accumulated_x = 0.0  # right (+) / left (-), metres
+        self.accumulated_y = 0.0  # forward (+) / back (-), metres
+        self.last_frame_time: Optional[float] = None
+
+    # ------------------------------------------------------------------ #
+    def meters_per_pixel(self, altitude_m: float, frame_width_px: int) -> float:
+        """Ground distance covered by one pixel at the given altitude."""
+        if self._mpp_override is not None:
+            return altitude_m * self._mpp_override
+        ground_width_m = 2.0 * altitude_m * math.tan(self.h_fov_rad / 2.0)
+        return ground_width_m / frame_width_px
+
+    @staticmethod
+    def _to_gray(frame: np.ndarray) -> np.ndarray:
+        return frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def _detect(self, gray: np.ndarray, mask: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        return cv2.goodFeaturesToTrack(gray, mask=mask, **self.feature_params)
+
+    def initialize_tracking(self, frame: np.ndarray) -> None:
+        """Seed the tracker from the first frame."""
+        self.prev_gray = self._to_gray(frame)
+        self.prev_points = self._detect(self.prev_gray)
+        self.last_frame_time = time.time()
+        if self.prev_points is not None:
+            log.info("Locked onto %d terrain features", len(self.prev_points))
+        else:
+            log.warning("Low-texture terrain: no trackable features found")
+
+    def reset(self) -> None:
+        """Forget tracking state and accumulated drift (e.g. when GPS returns)."""
         self.prev_gray = None
         self.prev_points = None
-        self.accumulated_x = 0.0  # Estimated drift on X-axis (meters)
-        self.accumulated_y = 0.0  # Estimated drift on Y-axis (meters)
+        self.accumulated_x = 0.0
+        self.accumulated_y = 0.0
         self.last_frame_time = None
 
-    def initialize_tracking(self, frame):
+    # ------------------------------------------------------------------ #
+    def update_odometry(self, current_frame: np.ndarray, current_altitude: float) -> tuple[float, float]:
         """
-        Initializes tracking by converting the first frame to grayscale 
-        and detecting highly trackable corners.
-        """
-        self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.prev_points = cv2.goodFeaturesToTrack(self.prev_gray, mask=None, **self.feature_params)
-        self.last_frame_time = time.time()
-        
-        if self.prev_points is not None:
-            print(f"[VO INIT] Successfully locked onto {len(self.prev_points)} distinct terrain features.")
-        else:
-            print("[VO WARNING] Low texture terrain! Failed to locate trackable features.")
+        Estimate aircraft displacement since the previous frame.
 
-    def update_odometry(self, current_frame, current_altitude):
+        Returns (right_m, forward_m). Returns (0, 0) when tracking must be
+        (re)seeded, so callers can always add the result to a running estimate.
         """
-        Calculates frame-to-frame feature motion and scales it using drone altitude.
-        
-        Parameters:
-            current_frame (np.ndarray): The latest camera frame (BGR format)
-            current_altitude (float): Live relative altitude from barometer (meters)
-            
-        Returns:
-            delta_x (float): Shift in meters on X-axis since last update
-            delta_y (float): Shift in meters on Y-axis since last update
-        """
-        if self.prev_gray is None or self.prev_points is None:
-            self.initialize_tracking(current_frame)
+        gray = self._to_gray(current_frame)
+        if self.prev_gray is None or self.prev_points is None or len(self.prev_points) == 0:
+            self.initialize_tracking(gray)
             return 0.0, 0.0
 
-        # Convert incoming frame to grayscale for faster processing
-        gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
-        current_time = time.time()
-        dt = current_time - self.last_frame_time
-        
-        if dt <= 0.0:
-            return 0.0, 0.0
-
-        # Calculate Lucas-Kanade optical flow between consecutive frames
-        next_points, status, error = cv2.calcOpticalFlowPyrLK(
+        now = time.time()
+        next_points, status, _err = cv2.calcOpticalFlowPyrLK(
             self.prev_gray, gray, self.prev_points, None, **self.lk_params
         )
 
-        # Select only the features that were successfully tracked in both frames
-        if next_points is not None and status is not None:
-            good_new = next_points[status == 1]
-            good_old = self.prev_points[status == 1]
+        if next_points is None or status is None:
+            tracked = np.zeros(0, dtype=bool)
         else:
-            good_new = np.array([])
-            good_old = np.array([])
+            tracked = status.ravel() == 1
 
-        # Handle failure case: If we lose too many points, re-detect features and return
-        if len(good_new) < 10:
-            print("[VO ALERT] Tracking points depleted! Re-initializing feature grid...")
+        if tracked.sum() < self.MIN_TRACKED_POINTS:
+            log.warning("Tracking points depleted (%d); re-seeding feature grid", int(tracked.sum()))
             self.prev_gray = gray
-            self.prev_points = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
-            self.last_frame_time = current_time
+            self.prev_points = self._detect(gray)
+            self.last_frame_time = now
             return 0.0, 0.0
 
-        # Calculate average pixel displacement across all tracked features
-        diffs = good_new - good_old
-        avg_pixel_dx = np.mean(diffs[:, 0])
-        avg_pixel_dy = np.mean(diffs[:, 1])
+        good_new = next_points[tracked].reshape(-1, 2)
+        good_old = self.prev_points[tracked].reshape(-1, 2)
 
-        # Altitude Scaling: A pixel shift at 10m covers less physical ground than at 50m.
-        # We adjust our physical estimation dynamically using the barometer's altitude.
-        altitude_scale = current_altitude * self.scaling_factor
-        
-        # Convert pixel motion to estimated physical meters
-        delta_x = float(avg_pixel_dx * altitude_scale)
-        delta_y = float(avg_pixel_dy * altitude_scale)
+        # Median is robust to the odd feature that latched onto moving debris.
+        flow = np.median(good_new - good_old, axis=0)
+        mpp = self.meters_per_pixel(current_altitude, gray.shape[1])
 
-        # Accumulate estimated total drift distance from origin
-        self.accumulated_x += delta_x
-        self.accumulated_y += delta_y
+        # Ground moving left in the image means the aircraft moved right;
+        # ground moving down (+y in image coords) means the aircraft moved forward.
+        right_m = float(-flow[0] * mpp)
+        forward_m = float(flow[1] * mpp)
 
-        # Update state for the next frame transaction
+        self.accumulated_x += right_m
+        self.accumulated_y += forward_m
+
         self.prev_gray = gray
-        self.prev_points = good_new.reshape(-1, 1, 2)
-        self.last_frame_time = current_time
+        self.prev_points = good_new.reshape(-1, 1, 2).astype(np.float32)
+        self.last_frame_time = now
 
-        # Every 10 frames, refresh the feature list to discard aged or out-of-frame corners
-        if len(self.prev_points) < (self.max_features * 0.6):
-            new_features = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
-            if new_features is not None:
-                self.prev_points = np.vstack((self.prev_points, new_features))
-                # Deduplicate coordinates and keep within limit
-                self.prev_points = self.prev_points[:self.max_features]
+        # Top up the feature set when it has thinned, masking out existing points
+        # so we do not track the same corner twice.
+        if len(self.prev_points) < self.max_features * self.replenish_ratio:
+            mask = np.full(gray.shape, 255, dtype=np.uint8)
+            for x, y in self.prev_points.reshape(-1, 2):
+                cv2.circle(mask, (int(x), int(y)), self.feature_params["minDistance"], 0, -1)
+            fresh = self._detect(gray, mask)
+            if fresh is not None:
+                self.prev_points = np.vstack((self.prev_points, fresh))[: self.max_features]
 
-        return delta_x, delta_y
+        return right_m, forward_m
 
 
 # =====================================================================
 # INTEGRATION TESTING RUN (Executable validation)
 # =====================================================================
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     print("[TEST] Initializing Sentry Flyer Visual Odometry Tracker...")
     vo = VisualOdometry()
 
-    # Generate mock camera frame 1 (Solid gray background with 4 distinct black tracking blocks)
-    frame_t0 = np.full((480, 640, 3), 180, dtype=np.uint8)
-    cv2.rectangle(frame_t0, (100, 100), (120, 120), (0, 0, 0), -1)
-    cv2.rectangle(frame_t0, (500, 100), (520, 120), (0, 0, 0), -1)
-    cv2.rectangle(frame_t0, (100, 350), (120, 370), (0, 0, 0), -1)
-    cv2.rectangle(frame_t0, (500, 350), (520, 370), (0, 0, 0), -1)
+    def make_frame(shift_px: int) -> np.ndarray:
+        frame = np.full((480, 640, 3), 180, dtype=np.uint8)
+        for cx, cy in ((110, 110), (510, 110), (110, 360), (510, 360)):
+            x0 = cx - 10 + shift_px
+            cv2.rectangle(frame, (x0, cy - 10), (x0 + 20, cy + 10), (0, 0, 0), -1)
+        return frame
 
-    # Initialize tracking with frame 1
-    vo.initialize_tracking(frame_t0)
-
-    # Generate mock camera frame 2 (Simulate drone drifting right: all physical features move left by 8 pixels)
-    frame_t1 = np.full((480, 640, 3), 180, dtype=np.uint8)
-    cv2.rectangle(frame_t1, (92, 100), (112, 120), (0, 0, 0), -1)
-    cv2.rectangle(frame_t1, (492, 100), (512, 120), (0, 0, 0), -1)
-    cv2.rectangle(frame_t1, (92, 350), (112, 370), (0, 0, 0), -1)
-    cv2.rectangle(frame_t1, (492, 350), (512, 370), (0, 0, 0), -1)
-
-    # Calculate drift assuming a flight altitude of 20 meters
-    dx, dy = vo.update_odometry(frame_t1, current_altitude=20.0)
+    vo.initialize_tracking(make_frame(0))
+    # Ground features move left 8 px, so the aircraft drifted right.
+    dx, dy = vo.update_odometry(make_frame(-8), current_altitude=20.0)
 
     print("\n=== VISUAL ODOMETRY CALCULATOR ===")
-    print(f"Calculated Shift X:  {dx:.4f} meters")
-    print(f"Calculated Shift Y:  {dy:.4f} meters")
-    print(f"Accumulated Drift X: {vo.accumulated_x:.4f} meters")
-    print(f"Accumulated Drift Y: {vo.accumulated_y:.4f} meters")
+    print(f"Metres per pixel @20 m: {vo.meters_per_pixel(20.0, 640):.4f}")
+    print(f"Calculated Shift Right:   {dx:+.4f} m")
+    print(f"Calculated Shift Forward: {dy:+.4f} m")
+    print(f"Accumulated Drift Right:  {vo.accumulated_x:+.4f} m")
+    print(f"Accumulated Drift Fwd:    {vo.accumulated_y:+.4f} m")
     print("==================================\n")

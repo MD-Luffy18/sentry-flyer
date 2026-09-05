@@ -1,167 +1,220 @@
 """
 Sentry Flyer — MAVLink Mission Planner & Geofence Controller
 Location: Phase 1/planner.py
-Purpose: Establishes low-latency telemetry link with Pixhawk flight controller,
-         tracks live aircraft position, and enforces autonomous geofence boundaries.
+Purpose: Establishes a telemetry link with the Pixhawk flight controller,
+         tracks live aircraft position, enforces a circular geofence, and
+         generates lawnmower search patterns.
+
+Safety model: this module never commands motors. The only override it can
+issue is a mode change to RTL (return-to-launch), which the flight controller
+executes with its own stabilisation loop.
 """
 
-import time
+from __future__ import annotations
+
+import logging
 import math
-from pymavlink import mavutil
+import time
+from typing import Optional
+
+log = logging.getLogger("sentry.planner")
+
+EARTH_RADIUS_M = 6_371_000.0
+METERS_PER_DEG_LAT = 111_111.0
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in metres between two WGS-84 points."""
+    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
+    d_lat = rlat2 - rlat1
+    d_lon = math.radians(lon2 - lon1)
+    a = math.sin(d_lat / 2.0) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(d_lon / 2.0) ** 2
+    return 2.0 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def generate_lawnmower_waypoints(
+    sw_lat: float,
+    sw_lon: float,
+    ne_lat: float,
+    ne_lon: float,
+    rows: Optional[int] = None,
+    swath_m: Optional[float] = None,
+) -> list[tuple[float, float]]:
+    """
+    Lawnmower (boustrophedon) sweep over the bounding box (sw, ne).
+
+    Pass either `rows` (explicit number of east-west passes) or `swath_m`
+    (the camera's ground footprint width; rows are derived so adjacent passes
+    touch). Returns a list of (lat, lon) waypoints; each row contributes its
+    two ends, alternating direction so the drone never backtracks.
+    """
+    if rows is None:
+        if swath_m is None or swath_m <= 0:
+            raise ValueError("Provide rows>=1 or swath_m>0")
+        span_m = abs(ne_lat - sw_lat) * METERS_PER_DEG_LAT
+        rows = max(1, math.ceil(span_m / swath_m) + 1)
+    if rows < 1:
+        raise ValueError("rows must be >= 1")
+
+    lat_step = (ne_lat - sw_lat) / (rows - 1) if rows > 1 else 0.0
+    waypoints: list[tuple[float, float]] = []
+    for i in range(rows):
+        lat = sw_lat + i * lat_step
+        west, east = (lat, sw_lon), (lat, ne_lon)
+        waypoints.extend((west, east) if i % 2 == 0 else (east, west))
+    return waypoints
+
 
 class SentryPlanner:
-    def __init__(self, connection_string="/dev/ttyTHS1", baud_rate=921600):
+    def __init__(
+        self,
+        connection_string: str = "/dev/ttyTHS1",
+        baud_rate: int = 921600,
+        fence_center_lat: float = 25.31000,
+        fence_center_lon: float = 78.48800,
+        fence_radius_m: float = 500.0,
+        heartbeat_timeout_s: float = 30.0,
+    ):
         """
-        Initializes the MAVLink connection.
-        Default parameters are set for the Jetson Orin Nano's hardware serial port.
+        Open the MAVLink link. Defaults target the Jetson Orin Nano's hardware
+        serial port; use "udpin:localhost:14550" for a SITL simulator.
         """
-        print(f"[INIT] Connecting to Pixhawk on {connection_string} at {baud_rate} baud...")
-        # Establish serial connection using MAVLink protocol
+        # Imported lazily so the pure-math helpers above are usable without pymavlink.
+        from pymavlink import mavutil
+
+        self._mavutil = mavutil
+        log.info("Connecting to Pixhawk on %s at %d baud", connection_string, baud_rate)
         self.vehicle = mavutil.mavlink_connection(connection_string, baud=baud_rate)
-        
-        # Wait for first heartbeat packet from Pixhawk to confirm connection
-        print("[INIT] Waiting for vehicle system heartbeat...")
-        self.vehicle.wait_heartbeat()
-        print(f"[INIT] Heartbeat received! System ID: {self.vehicle.target_system}, Component ID: {self.vehicle.target_component}")
-        
-        # Cache variables for tracking drone position
+
+        log.info("Waiting for vehicle heartbeat (timeout %.0fs)...", heartbeat_timeout_s)
+        if self.vehicle.wait_heartbeat(timeout=heartbeat_timeout_s) is None:
+            raise TimeoutError("No MAVLink heartbeat received")
+        log.info(
+            "Heartbeat received. System ID: %s, Component ID: %s",
+            self.vehicle.target_system,
+            self.vehicle.target_component,
+        )
+
         self.current_lat = 0.0
         self.current_lon = 0.0
         self.current_alt = 0.0
-        
-        # Geofence parameters (Center coordinate and absolute safety radius in meters)
-        self.fence_center_lat = 25.31000
-        self.fence_center_lon = 78.48800
-        self.fence_radius_meters = 500.0  # Limit drone to a 500m operations bubble
+        self.last_fix_time: Optional[float] = None
 
-    def request_data_stream(self):
-        """
-        Requests specific high-frequency telemetry data streams from the Pixhawk.
-        """
-        # Request global position data (lat/lon/alt) at 10 Hz
+        self.fence_center_lat = fence_center_lat
+        self.fence_center_lon = fence_center_lon
+        self.fence_radius_meters = fence_radius_m
+        self.rtl_engaged = False
+
+    # ------------------------------------------------------------------ #
+    # Telemetry
+    # ------------------------------------------------------------------ #
+    def request_data_stream(self, rate_hz: int = 10) -> None:
+        """Ask the autopilot for GLOBAL_POSITION_INT at `rate_hz`."""
+        mav = self._mavutil.mavlink
+        # Modern autopilots honour SET_MESSAGE_INTERVAL (interval in microseconds).
+        self.vehicle.mav.command_long_send(
+            self.vehicle.target_system,
+            self.vehicle.target_component,
+            mav.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            mav.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
+            int(1_000_000 / rate_hz),
+            0, 0, 0, 0, 0,
+        )
+        # Legacy stream request kept for older ArduPilot builds.
         self.vehicle.mav.request_data_stream_send(
             self.vehicle.target_system,
             self.vehicle.target_component,
-            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
-            10,  # Rate in Hz
-            1    # 1 to start stream, 0 to stop
+            mav.MAV_DATA_STREAM_POSITION,
+            rate_hz,
+            1,
         )
 
-    def read_telemetry(self):
-        """
-        Reads incoming MAVLink packets and updates current aircraft coordinates.
-        """
-        # Read a non-blocking incoming MAVLink message
-        msg = self.vehicle.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
-        if msg:
-            # Pixhawk scales raw GPS coordinate floats by 1E7 to transmit as integers
-            self.current_lat = msg.lat / 1.0e7
-            self.current_lon = msg.lon / 1.0e7
-            self.current_alt = msg.relative_alt / 1000.0  # Convert millimeters to meters
-            return True
-        return False
-
-    def calculate_distance_to_center(self):
-        """
-        Calculates the 2D planar distance from the geofence center to the drone.
-        Uses Haversine spherical math to maintain sub-meter precision in the field.
-        """
-        earth_radius = 6371000.0  # Earth's radius in meters
-        
-        # Convert degrees to radians
-        lat1 = math.radians(self.fence_center_lat)
-        lon1 = math.radians(self.fence_center_lon)
-        lat2 = math.radians(self.current_lat)
-        lon2 = math.radians(self.current_lon)
-        
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        
-        # Haversine calculation
-        a = (math.sin(dlat / 2.0) ** 2) + \
-            (math.cos(lat1) * math.cos(lat2) * (math.sin(dlon / 2.0) ** 2))
-        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
-        
-        return earth_radius * c
-
-    def check_geofence_breach(self):
-        """
-        Monitors live location and triggers automatic failsafe if boundary is breached.
-        """
-        if self.current_lat == 0.0 or self.current_lon == 0.0:
-            # Skip check if GPS data is not yet initialized
+    def read_telemetry(self) -> bool:
+        """Drain one GLOBAL_POSITION_INT packet if available. Returns True on update."""
+        msg = self.vehicle.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
+        if not msg:
             return False
-            
+        # The autopilot scales lat/lon by 1e7 and altitude by 1e3 to send integers.
+        self.current_lat = msg.lat / 1.0e7
+        self.current_lon = msg.lon / 1.0e7
+        self.current_alt = msg.relative_alt / 1000.0
+        self.last_fix_time = time.time()
+        return True
+
+    @property
+    def has_fix(self) -> bool:
+        return self.last_fix_time is not None or (self.current_lat != 0.0 and self.current_lon != 0.0)
+
+    # ------------------------------------------------------------------ #
+    # Geofence
+    # ------------------------------------------------------------------ #
+    def calculate_distance_to_center(self) -> float:
+        """Great-circle distance in metres from the fence centre to the aircraft."""
+        return haversine_m(self.fence_center_lat, self.fence_center_lon, self.current_lat, self.current_lon)
+
+    def check_geofence_breach(self) -> bool:
+        """
+        Compare live position to the fence and engage RTL once on breach.
+        Returns True while the aircraft is outside the fence.
+        """
+        if not self.has_fix:
+            return False
+
         distance = self.calculate_distance_to_center()
-        
-        if distance > self.fence_radius_meters:
-            print(f"[FAILSAFE ALERT] GEOFENCE BREACHED! Distance: {distance:.2f}m exceeds limit of {self.fence_radius_meters}m.")
+        if distance <= self.fence_radius_meters:
+            return False
+
+        if not self.rtl_engaged:
+            log.critical(
+                "GEOFENCE BREACHED: %.1f m from centre exceeds %.0f m limit",
+                distance,
+                self.fence_radius_meters,
+            )
             self.trigger_return_to_home()
-            return True
-        return False
+        return True
 
-    def trigger_return_to_home(self):
-        """
-        Sends a high-priority command to Pixhawk overriding current mission to RTL.
-        """
-        print("[FAILSAFE COMMAND] Force-engaging RETURN-TO-LAUNCH (RTL) mode on Pixhawk...")
-        
-        # MAVLink custom mode for RTL in ArduPilot is mode number 6
-        # We target the flight controller using system ID and component ID
-        self.vehicle.set_mode('RTL')
+    def trigger_return_to_home(self) -> None:
+        """Override the current mission with RTL. Idempotent."""
+        if self.rtl_engaged:
+            return
+        log.critical("Engaging RETURN-TO-LAUNCH on flight controller")
+        self.vehicle.set_mode("RTL")
+        self.rtl_engaged = True
 
-    def generate_lawnmower_waypoints(self, sw_lat, sw_lon, ne_lat, ne_lon, rows=5):
-        """
-        Algorithmic coordinates sweep generator (Lawnmower sweep pattern).
-        Generates snake-like grid pathing bounds for systematic area search.
-        """
-        grid_waypoints = []
-        lat_step = (ne_lat - sw_lat) / (rows - 1)
-        
-        for i in range(rows):
-            # Calculate target row latitude
-            target_lat = sw_lat + (i * lat_step)
-            
-            # Snake-like sweep direction toggle
-            if i % 2 == 0:
-                # West to East
-                grid_waypoints.append((target_lat, sw_lon))
-                grid_waypoints.append((target_lat, ne_lon))
-            else:
-                # East to West
-                grid_waypoints.append((target_lat, ne_lon))
-                grid_waypoints.append((target_lat, sw_lon))
-                
-        return grid_waypoints
+    # Kept as a method for backwards compatibility with earlier callers.
+    def generate_lawnmower_waypoints(self, sw_lat, sw_lon, ne_lat, ne_lon, rows=5, swath_m=None):
+        return generate_lawnmower_waypoints(sw_lat, sw_lon, ne_lat, ne_lon, rows=rows, swath_m=swath_m)
 
 
 # =====================================================================
-# HARDWARE TELEMENTRY TEST EMULATION RUN
+# HARDWARE TELEMETRY TEST EMULATION RUN
 # =====================================================================
 if __name__ == "__main__":
-    # For local system software dry-runs without a physical hardware serial line,
-    # we bind the telemetry port to a local UDP loopback stream (port 14550) used by simulators.
-    print("[TEST] Running Local Emulation Loop on standard UDP loopback...")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    print("[TEST] Lawnmower pattern over a 100 m x 100 m box with a 30 m swath:")
+    for wp in generate_lawnmower_waypoints(25.3100, 78.4880, 25.3109, 78.4890, swath_m=30.0):
+        print(f"  ({wp[0]:.5f}, {wp[1]:.5f})")
+
+    # Without a physical serial line, bind to the UDP loopback used by SITL simulators.
+    print("\n[TEST] Running local emulation loop on UDP loopback (udpin:localhost:14550)...")
     try:
-        planner = SentryPlanner(connection_string="udpin:localhost:14550")
+        planner = SentryPlanner(connection_string="udpin:localhost:14550", heartbeat_timeout_s=5.0)
         planner.request_data_stream()
-        
+
         print("\n[TEST] Emulating active boundary checking...")
-        # Simulate active coordinate ingestion
         for step in range(5):
-            # Inject simulated coordinates heading slowly out of bounds
-            planner.current_lat = 25.31000 + (step * 0.0015)
-            planner.current_lon = 78.48800 + (step * 0.0015)
-            
+            # Inject coordinates heading slowly out of bounds.
+            planner.current_lat = 25.31000 + step * 0.0015
+            planner.current_lon = 78.48800 + step * 0.0015
+            planner.last_fix_time = time.time()
+
             dist = planner.calculate_distance_to_center()
-            print(f"Step {step+1} | Pos: ({planner.current_lat:.5f}, {planner.current_lon:.5f}) | Dist: {dist:.1f}m")
-            
-            # Check boundary limits
-            breached = planner.check_geofence_breach()
-            if breached:
+            print(f"Step {step + 1} | Pos: ({planner.current_lat:.5f}, {planner.current_lon:.5f}) | Dist: {dist:.1f}m")
+            if planner.check_geofence_breach():
                 break
             time.sleep(0.5)
-            
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - surface any link failure to the operator
         print(f"\n[EMULATOR STOPPED] Local device not connected. Details: {e}")
-        print("[INFO] Use this script on the physical Jetson connected to the Pixhawk's TELEM1/TELEM2 telemetry port.")
+        print("[INFO] Run this on the Jetson connected to the Pixhawk's TELEM1/TELEM2 port.")

@@ -1,0 +1,10 @@
+# Sentry Flyer runtime dependencies.
+# On the Jetson, install OpenCV from NVIDIA's JetPack wheels (CUDA-enabled)
+# instead of the PyPI package below.
+numpy>=1.26
+opencv-python-headless>=4.9
+flask>=3.0
+pymavlink>=2.4
+
+# Development / testing
+pytest>=8.0
