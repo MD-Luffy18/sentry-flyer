@@ -1,8 +1,12 @@
 -- =====================================================================
 -- Sentry Flyer — Onboard Relational Database Schema
 -- Location: Phase 1/schema.sql
--- Purpose: Optimized relational schema for high-speed offline storage, 
---          indexing, and spatial coordinates triage.
+-- Purpose: Relational schema for high-speed offline storage, indexing,
+--          and spatial triage of detections.
+--
+-- This file is the single source of truth for the schema. database.py
+-- and the Phase 5 dashboard both load it at start-up; do not duplicate
+-- CREATE TABLE statements elsewhere.
 -- =====================================================================
 
 -- Table 1: Raw Drone Telemetry Logs
@@ -23,18 +27,22 @@ CREATE TABLE IF NOT EXISTS telemetry_logs (
 -- Records every single frame prediction from the onboard Edge AI models.
 CREATE TABLE IF NOT EXISTS raw_detections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    class_name TEXT NOT NULL,      -- 'person', 'fire', 'smoke', 'flood', etc.
+    class_name TEXT NOT NULL,      -- 'person', 'fire', 'smoke', 'floodwater', etc.
     latitude REAL NOT NULL,        -- Projected ground coordinate
     longitude REAL NOT NULL,       -- Projected ground coordinate
-    confidence REAL NOT NULL,      -- Model confidence output (0.00 to 1.00)
-    severity INTEGER NOT NULL,     -- Responder urgency score (0 to 100)
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    severity INTEGER NOT NULL CHECK (severity >= 0 AND severity <= 100),
     timestamp REAL NOT NULL,       -- Epoch timestamp of capture
     sensor_mode TEXT NOT NULL,     -- 'RGB', 'Thermal', or 'Fused'
-    frame_filename TEXT            -- Filename of captured frame on local storage
+    frame_filename TEXT,           -- Filename of captured frame on local storage
+    cluster_id INTEGER REFERENCES fused_clusters(id) ON DELETE SET NULL
 );
 
 -- Table 3: Fused Target Clusters
--- Consolidates spatial coordinates within 20m into distinct, high-value triage pins.
+-- Consolidates detections within CLUSTER_RADIUS_M (20 m) into distinct,
+-- high-value triage pins. Centre/mean/max are maintained incrementally by
+-- database.py so an update is O(1) regardless of how many raw detections
+-- feed the cluster.
 CREATE TABLE IF NOT EXISTS fused_clusters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     class_name TEXT NOT NULL,
@@ -42,16 +50,20 @@ CREATE TABLE IF NOT EXISTS fused_clusters (
     center_longitude REAL NOT NULL,
     mean_confidence REAL NOT NULL,
     max_severity INTEGER NOT NULL,
-    detection_count INTEGER DEFAULT 1,
+    detection_count INTEGER NOT NULL DEFAULT 1,
+    first_seen REAL NOT NULL,
     last_updated REAL NOT NULL
 );
 
 -- =====================================================================
--- DATABASE PERFORMANCE INDEXES (High-Speed Spatial & Temporal Queries)
+-- PERFORMANCE INDEXES
 -- =====================================================================
--- These indexes prevent database slowdowns during high-frequency telemetry tracking 
--- and allow instant bounding-box queries for map rendering.
+-- Telemetry is queried by "latest" and by time window.
 CREATE INDEX IF NOT EXISTS idx_telemetry_time ON telemetry_logs(timestamp);
-CREATE INDEX IF NOT EXISTS idx_detections_spatial ON raw_detections(latitude, longitude);
-CREATE INDEX IF NOT EXISTS idx_detections_class ON raw_detections(class_name);
-CREATE INDEX IF NOT EXISTS idx_clusters_spatial ON fused_clusters(center_latitude, center_longitude);
+
+-- Cluster matching filters by class first, then by a lat/lon bounding box.
+CREATE INDEX IF NOT EXISTS idx_detections_class_spatial
+    ON raw_detections(class_name, latitude, longitude);
+CREATE INDEX IF NOT EXISTS idx_detections_cluster ON raw_detections(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_clusters_class_spatial
+    ON fused_clusters(class_name, center_latitude, center_longitude);

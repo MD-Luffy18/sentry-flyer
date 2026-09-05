@@ -192,34 +192,61 @@ That's a concrete, demonstrable false-positive reduction a judge can be shown di
 
 ```
 sentry-flyer/
-├── firmware/              # ArduPilot/PX4 configs & any flight-controller customizations
-├── perception/             # Detection models, training scripts, inference pipeline
-│   ├── models/
-│   ├── train.py
-│   └── detect.py
-├── mission/                 # Search-pattern planner, geofencing, geo-tagging
-├── reporting/               # Confidence/severity scoring, situation report generation
-├── ground_station/    # Dashboard (Flask/Streamlit), map rendering
-├── simulation/            # Synthetic flight & detection test data
-├── hardware/             # CAD files, wiring diagrams, component datasheets
-├── docs/                     # Technical concept note, timeline, references
-├── demo/                   # Flight logs, sample reports, demo video
+├── Sentry_Flyer Codes/
+│   ├── Phase 1/
+│   │   ├── schema.sql            # Single source of truth for the mission database schema
+│   │   ├── database.py           # SQLite persistence + incremental 20 m Haversine clustering
+│   │   └── planner.py            # MAVLink link, circular geofence -> RTL, lawnmower search pattern
+│   ├── Phase 2/
+│   │   ├── odometry.py           # Lucas-Kanade visual odometry fallback for GPS-denied flight
+│   │   └── projection.py         # Pixel -> WGS-84 ground projection from altitude, yaw, gimbal pitch
+│   ├── Phase 3/
+│   │   ├── detect.py             # ONNX detector via OpenCV DNN (YOLOv5/v8 layouts), CUDA when present
+│   │   └── fusion.py             # Thermal/RGB homography + radiometric cross-check of detections
+│   ├── Phase 4/
+│   │   └── report_generator.py   # GeoJSON SitRep + checksummed, size-capped LoRa packet
+│   └── Phase 5/
+│       └── app.py                # Offline Flask ground station: canvas map, triage queue, GeoJSON download
+├── tests/
+│   └── test_modules.py           # pytest suite covering every module above
 ├── requirements.txt
 ├── LICENSE
 └── README.md
 ```
 
+Every module has a `__main__` self-test you can run directly, and no module needs
+the drone hardware to import: the MAVLink link is only opened when `SentryPlanner`
+is constructed, and the detector falls back to a simulated result when no ONNX
+weights are supplied.
+
 ---
 
 ## 🏁 Getting Started
 
-> Setup instructions will be filled in as each module comes online during development.
-
 ```bash
-git clone https://github.com/<org>/sentry-flyer.git
+git clone https://github.com/MD-Luffy18/sentry-flyer.git
 cd sentry-flyer
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+
+# Run the unit tests
+pytest tests/
+
+# Launch the ground station with the built-in flight simulator
+python "Sentry_Flyer Codes/Phase 5/app.py"
+# then open http://127.0.0.1:5000
 ```
+
+Ground-station configuration is via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SENTRY_DB` | `Sentry_Flyer Codes/Phase 1/sentry_mission.db` | Mission database the drone writes to |
+| `SENTRY_HOST` / `SENTRY_PORT` | `127.0.0.1` / `5000` | Set host to `0.0.0.0` to serve a field LAN |
+| `SENTRY_SIMULATE` | `1` | Set to `0` on a real flight so the demo simulator stays off |
+
+On the Jetson, install NVIDIA's CUDA-enabled OpenCV build instead of the PyPI
+wheel; `detect.py` picks the CUDA backend automatically when it is available.
 
 ---
 

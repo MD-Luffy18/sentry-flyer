@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Mission artefacts generated at runtime
+*.db
+*.db-wal
+*.db-shm
+*.geojson
+lora_packet.txt
+
+# Model weights
+*.onnx
+*.engine
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
